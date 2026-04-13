@@ -161,9 +161,11 @@ func NeedsSetup() bool {
 		return false // Lock file exists, already installed
 	}
 
-	// Check 3: AUTO_SETUP container mode + externally initialized DB
-	// If DB already has migration history, treat as installed to avoid setup page loop.
-	if AutoSetupEnabled() && databaseAlreadyInitializedFromEnv() {
+	// Check 3: externally initialized DB fallback
+	// In some hosted platforms env names may not be DATABASE_* and AUTO_SETUP may be omitted.
+	// If we can discover a reachable DB from env and it already has migration history,
+	// treat as installed to avoid setup page loop after container restart.
+	if databaseAlreadyInitializedFromEnv() {
 		return false
 	}
 
@@ -171,27 +173,56 @@ func NeedsSetup() bool {
 }
 
 func databaseAlreadyInitializedFromEnv() bool {
-	host := strings.TrimSpace(os.Getenv("DATABASE_HOST"))
-	portStr := strings.TrimSpace(os.Getenv("DATABASE_PORT"))
-	user := strings.TrimSpace(os.Getenv("DATABASE_USER"))
-	password := os.Getenv("DATABASE_PASSWORD")
-	dbName := strings.TrimSpace(os.Getenv("DATABASE_DBNAME"))
-	sslMode := strings.TrimSpace(getEnvOrDefault("DATABASE_SSLMODE", "disable"))
+	if dsn, ok := resolveDatabaseDSNFromEnv(); ok {
+		return databaseHasMigrationHistory(dsn)
+	}
+	return false
+}
+
+func resolveDatabaseDSNFromEnv() (string, bool) {
+	// 1) URL-style envs commonly used by hosted platforms.
+	for _, key := range []string{"DATABASE_URL", "POSTGRES_URL", "POSTGRESQL_URL"} {
+		if dsn := strings.TrimSpace(os.Getenv(key)); dsn != "" {
+			return dsn, true
+		}
+	}
+
+	// 2) Field-style envs. Try DATABASE_* first, then POSTGRES_*, then PG*.
+	host := firstNonEmptyEnv("DATABASE_HOST", "POSTGRES_HOST", "PGHOST")
+	portStr := firstNonEmptyEnv("DATABASE_PORT", "POSTGRES_PORT", "PGPORT")
+	user := firstNonEmptyEnv("DATABASE_USER", "POSTGRES_USER", "PGUSER")
+	password := firstNonEmptyEnv("DATABASE_PASSWORD", "POSTGRES_PASSWORD", "PGPASSWORD")
+	dbName := firstNonEmptyEnv("DATABASE_DBNAME", "DATABASE_NAME", "POSTGRES_DB", "PGDATABASE")
+	sslMode := firstNonEmptyEnv("DATABASE_SSLMODE", "POSTGRES_SSLMODE", "PGSSLMODE")
 	if sslMode == "" {
 		sslMode = "disable"
 	}
+
 	if host == "" || portStr == "" || user == "" || dbName == "" {
-		return false
+		return "", false
 	}
-	port, err := strconv.Atoi(portStr)
+	port, err := strconv.Atoi(strings.TrimSpace(portStr))
 	if err != nil || port <= 0 {
-		return false
+		return "", false
 	}
 
 	dsn := fmt.Sprintf(
 		"host=%s port=%d user=%s password=%s dbname=%s sslmode=%s connect_timeout=3",
 		host, port, user, password, dbName, sslMode,
 	)
+	return dsn, true
+}
+
+func firstNonEmptyEnv(keys ...string) string {
+	for _, key := range keys {
+		if val := strings.TrimSpace(os.Getenv(key)); val != "" {
+			return val
+		}
+	}
+	return ""
+}
+
+func databaseHasMigrationHistory(dsn string) bool {
 	db, err := sql.Open("postgres", dsn)
 	if err != nil {
 		return false
