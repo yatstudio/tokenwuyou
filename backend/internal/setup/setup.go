@@ -145,7 +145,11 @@ func decideAdminBootstrap(totalUsers, adminUsers int64) adminBootstrapDecision {
 }
 
 // NeedsSetup checks if the system needs initial setup
-// Uses multiple checks to prevent attackers from forcing re-setup by deleting config
+// Uses multiple checks to prevent attackers from forcing re-setup by deleting config.
+//
+// In container platforms without persistent /app/data, config.yaml/.installed may be lost
+// after restart even though the external database is already initialized. For AUTO_SETUP
+// deployments, we detect this case from DATABASE_* and skip setup wizard to avoid loops.
 func NeedsSetup() bool {
 	// Check 1: Config file must not exist
 	if _, err := os.Stat(GetConfigFilePath()); !os.IsNotExist(err) {
@@ -157,7 +161,63 @@ func NeedsSetup() bool {
 		return false // Lock file exists, already installed
 	}
 
+	// Check 3: AUTO_SETUP container mode + externally initialized DB
+	// If DB already has migration history, treat as installed to avoid setup page loop.
+	if AutoSetupEnabled() && databaseAlreadyInitializedFromEnv() {
+		return false
+	}
+
 	return true
+}
+
+func databaseAlreadyInitializedFromEnv() bool {
+	host := strings.TrimSpace(os.Getenv("DATABASE_HOST"))
+	portStr := strings.TrimSpace(os.Getenv("DATABASE_PORT"))
+	user := strings.TrimSpace(os.Getenv("DATABASE_USER"))
+	password := os.Getenv("DATABASE_PASSWORD")
+	dbName := strings.TrimSpace(os.Getenv("DATABASE_DBNAME"))
+	sslMode := strings.TrimSpace(getEnvOrDefault("DATABASE_SSLMODE", "disable"))
+	if sslMode == "" {
+		sslMode = "disable"
+	}
+	if host == "" || portStr == "" || user == "" || dbName == "" {
+		return false
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port <= 0 {
+		return false
+	}
+
+	dsn := fmt.Sprintf(
+		"host=%s port=%d user=%s password=%s dbname=%s sslmode=%s connect_timeout=3",
+		host, port, user, password, dbName, sslMode,
+	)
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		return false
+	}
+	defer func() { _ = db.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := db.PingContext(ctx); err != nil {
+		return false
+	}
+
+	var hasSchemaMigrations bool
+	err = db.QueryRowContext(ctx,
+		"SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='schema_migrations')",
+	).Scan(&hasSchemaMigrations)
+	if err != nil || !hasSchemaMigrations {
+		return false
+	}
+
+	var migrationCount int
+	err = db.QueryRowContext(ctx, "SELECT COUNT(1) FROM schema_migrations").Scan(&migrationCount)
+	if err != nil {
+		return false
+	}
+	return migrationCount > 0
 }
 
 // TestDatabaseConnection tests the database connection and creates database if not exists
